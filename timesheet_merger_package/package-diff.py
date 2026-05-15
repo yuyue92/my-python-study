@@ -23,3 +23,11 @@
      shutil.copy(template_path, out_path)
 +    _remove_external_links(out_path)   # ← 新增这一行
      wb = openpyxl.load_workbook(out_path)
+
+-----------
+
+if item.filename == 'xl/workbook.xml':
+      data = re.sub(rb'<externalReference[^>]+/>', b'', data)
+      data = re.sub(rb'<externalReferences>.*?</externalReferences>', b'', data, flags=re.DOTALL)
++     # 清除 definedNames 里引用外部工作簿的条目（形如 [1]Sheet!$A$1）
++     data = re.sub(rb'<definedName[^>]*>\[[0-9]+\][^<]*</definedName>', b'', data)
