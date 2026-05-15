@@ -193,13 +193,15 @@ def parse_source(path: Path) -> tuple[str, list[dict]]:
     fmt = detect_format(wb)
 
     all_rows = []
+    # 只处理 sheetname == 'Timesheet' 的 sheet，其余一律跳过
     for sname in wb.sheetnames:
-        if sname.lower() in SKIP_SHEETS:
+        if sname.lower() != "timesheet":
+            print(f"  [跳过] sheet '{sname}'：非 Timesheet")
             continue
 
         ws = wb[sname]
         if ws.sheet_state != "visible":
-            print(f"  [跳过] {path.name} → sheet '{sname}'：隐藏 sheet，忽略")
+            print(f"  [跳过] sheet '{sname}'：隐藏 sheet，忽略")
             continue
 
         # 在前5行内扫描 Staff ID 和 Name（兼容第1行空白的情况）
@@ -343,8 +345,8 @@ def main():
     old_records: list[dict] = []
     new_records: list[dict] = []
 
-    for path in files:
-        print(f"\n处理：{path.name}")
+    for idx, path in enumerate(files, 1):
+        print(f"\n[{idx}/{len(files)}] 处理：{path.name}")
         try:
             fmt, rows = parse_source(path)
             if fmt == "new":
