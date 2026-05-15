@@ -189,7 +189,7 @@ def parse_source(path: Path) -> tuple[str, list[dict]]:
     读取一个源文件，返回 (格式类型, 记录列表)。
     格式类型: 'old' | 'new'
     """
-    wb = openpyxl.load_workbook(path, data_only=True)
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True, keep_links=False)
     fmt = detect_format(wb)
 
     all_rows = []
@@ -200,9 +200,12 @@ def parse_source(path: Path) -> tuple[str, list[dict]]:
             continue
 
         ws = wb[sname]
-        if ws.sheet_state != "visible":
-            print(f"  [跳过] sheet '{sname}'：隐藏 sheet，忽略")
-            continue
+        try:
+            if ws.sheet_state != "visible":
+                print(f"  [跳过] sheet '{sname}'：隐藏 sheet，忽略")
+                continue
+        except AttributeError:
+            pass  # read_only 模式下 sheet_state 不可用，继续处理
 
         # 在前5行内扫描 Staff ID 和 Name（兼容第1行空白的情况）
         staff_id, emp_name = "", ""
@@ -228,6 +231,7 @@ def parse_source(path: Path) -> tuple[str, list[dict]]:
         except ValueError as e:
             print(f"  [警告] {path.name} → '{sname}'：{e}，已跳过")
 
+    wb.close()
     return fmt, all_rows
 
 
@@ -270,6 +274,42 @@ def write_old_format(records: list[dict], template_path: Path, out_path: Path):
 # ─────────────────────────────────────────────
 # Step 6：写入 new-format 模板
 # ─────────────────────────────────────────────
+def _remove_external_links(xlsx_path: Path):
+    """
+    清除 xlsx 文件内嵌的 externalLinks（外部链接）。
+    模板若含断链外部引用，Excel 打开时会弹出修复警告，此函数提前清理。
+    """
+    import zipfile, shutil, re
+    tmp_path = xlsx_path.with_suffix('.tmp.xlsx')
+    with zipfile.ZipFile(xlsx_path, 'r') as zin,          zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            # 跳过 externalLinks 相关文件
+            if 'externalLinks' in item.filename:
+                continue
+            data = zin.read(item.filename)
+            # 清理 workbook.xml 里对 externalLinks 的 Relationship 引用
+            if item.filename == 'xl/_rels/workbook.xml.rels':
+                data = re.sub(
+                    rb'<Relationship[^>]+externalLink[^>]+/>',
+                    b'', data
+                )
+            # 清理 workbook.xml 里的外部引用
+            if item.filename == 'xl/workbook.xml':
+                # 清除 <externalReferences> 整块
+                data = re.sub(rb'<externalReference[^>]+/>', b'', data)
+                data = re.sub(rb'<externalReferences>.*?</externalReferences>', b'', data, flags=re.DOTALL)
+                # 清除 definedNames 里引用外部工作簿的条目（形如 [1]Sheet!$A$1）
+                data = re.sub(rb'<definedName[^>]*>\[[0-9]+\][^<]*</definedName>', b'', data)
+            # 清理 [Content_Types].xml 里对 externalLinks 的声明
+            if item.filename == '[Content_Types].xml':
+                data = re.sub(
+                    rb'<Override[^>]+externalLink[^>]+/>',
+                    b'', data
+                )
+            zout.writestr(item, data)
+    tmp_path.replace(xlsx_path)
+
+
 def write_new_format(records: list[dict], template_path: Path, out_path: Path):
     """
     将记录写入 new-format 模板的 Timesheet sheet。
@@ -280,6 +320,7 @@ def write_new_format(records: list[dict], template_path: Path, out_path: Path):
     I=Status, J=Remarks, K=Staff ID, L=Name
     """
     shutil.copy(template_path, out_path)
+    _remove_external_links(out_path)   # 清除模板内嵌的断链外部引用
     wb = openpyxl.load_workbook(out_path)
     ws = wb[NEW_SHEET]
 
@@ -344,6 +385,9 @@ def main():
     # Step 2-4：逐文件解析，按格式分类
     old_records: list[dict] = []
     new_records: list[dict] = []
+    # 用 dict 保序去重：key=(Staff ID, Name)，value=所属格式
+    old_staff: dict[tuple, None] = {}
+    new_staff: dict[tuple, None] = {}
 
     for idx, path in enumerate(files, 1):
         print(f"\n[{idx}/{len(files)}] 处理：{path.name}")
@@ -351,8 +395,12 @@ def main():
             fmt, rows = parse_source(path)
             if fmt == "new":
                 new_records.extend(rows)
+                for r in rows:
+                    new_staff.setdefault((r["Staff ID"], r["Name"]), None)
             else:
                 old_records.extend(rows)
+                for r in rows:
+                    old_staff.setdefault((r["Staff ID"], r["Name"]), None)
         except Exception as e:
             print(f"  [错误] {path.name}：{e}，已跳过")
 
@@ -372,7 +420,24 @@ def main():
     else:
         print("[跳过] 无 new-format 数据，不生成 output_new.xlsx")
 
-    print(f"\n完成！old-format 共 {len(old_records)} 行，new-format 共 {len(new_records)} 行。")
+    # Step 7：员工统计汇总
+    print("\n" + "─" * 50)
+    print("📊 员工统计汇总")
+    print("─" * 50)
+
+    def _print_staff(label: str, staff: dict):
+        print(f"\n【{label}】共 {len(staff)} 人：")
+        if staff:
+            for i, (sid, name) in enumerate(staff.keys(), 1):
+                print(f"  {i:>3}. {sid:<12} {name}")
+        else:
+            print("  （无数据）")
+
+    _print_staff("output_old", old_staff)
+    _print_staff("output_new", new_staff)
+    print(f"\n{'─' * 50}")
+    print(f"合计：old-format {len(old_records)} 行 / {len(old_staff)} 人，"
+          f"new-format {len(new_records)} 行 / {len(new_staff)} 人。")
 
 
 if __name__ == "__main__":
