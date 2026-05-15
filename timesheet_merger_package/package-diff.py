@@ -1,20 +1,25 @@
--        # 从第1行读取 Staff ID 和 Name
--        row1 = list(ws.iter_rows(min_row=1, max_row=1, values_only=True))[0]
--        staff_id, emp_name = "", ""
--        for i, val in enumerate(row1):
--            if str(val or "").strip().lower() == "staff id" and i + 1 < len(row1):
--                staff_id = str(row1[i + 1] or "").strip()
--            if str(val or "").strip().lower() == "name" and i + 1 < len(row1):
--                emp_name = str(row1[i + 1] or "").strip()
-+        # 在前5行内扫描 Staff ID 和 Name（兼容第1行空白的情况）
-+        staff_id, emp_name = "", ""
-+        for scan_row in ws.iter_rows(min_row=1, max_row=5, values_only=True):
-+            row_vals = list(scan_row)
-+            for i, val in enumerate(row_vals):
-+                label = str(val or "").strip().lower()
-+                if label == "staff id" and i + 1 < len(row_vals):
-+                    staff_id = str(row_vals[i + 1] or "").strip()
-+                if label == "name" and i + 1 < len(row_vals):
-+                    emp_name = str(row_vals[i + 1] or "").strip()
-+            if staff_id and emp_name:
-+                break  # 两个都找到了，不再继续扫描
+# 新增 _remove_external_links() 函数，在 write_new_format 里调用
+
++def _remove_external_links(xlsx_path: Path):
++    import zipfile, shutil, re
++    tmp_path = xlsx_path.with_suffix('.tmp.xlsx')
++    with zipfile.ZipFile(xlsx_path, 'r') as zin, \
++         zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED) as zout:
++        for item in zin.infolist():
++            if 'externalLinks' in item.filename:
++                continue                          # 整个 externalLinks 目录跳过
++            data = zin.read(item.filename)
++            if item.filename == 'xl/_rels/workbook.xml.rels':
++                data = re.sub(rb'<Relationship[^>]+externalLink[^>]+/>', b'', data)
++            if item.filename == 'xl/workbook.xml':
++                data = re.sub(rb'<externalReference[^>]+/>', b'', data)
++                data = re.sub(rb'<externalReferences>.*?</externalReferences>', b'', data, flags=re.DOTALL)
++            if item.filename == '[Content_Types].xml':
++                data = re.sub(rb'<Override[^>]+externalLink[^>]+/>', b'', data)
++            zout.writestr(item, data)
++    tmp_path.replace(xlsx_path)
+
+ def write_new_format(...):
+     shutil.copy(template_path, out_path)
++    _remove_external_links(out_path)   # ← 新增这一行
+     wb = openpyxl.load_workbook(out_path)
