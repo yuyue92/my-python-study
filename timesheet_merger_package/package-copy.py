@@ -2,49 +2,44 @@
 Timesheet Merger
 ================
 从多个源文件（员工姓名.xlsx）提取考勤数据，
-按格式类型分别汇总输出到 output_old.xlsx / output_new.xlsx。
+统一汇总输出为单一 output_YYYYMMDD_HHMM.xlsx。
+
+输出固定 8 列：
+  Date | Role/Type | Task Nature | Module | Hours | Ref ID | Staff ID | Name
 
 使用方法：
   python timesheet_merger.py
-  或指定目录：
   python timesheet_merger.py --src ./源文件目录 --out ./输出目录
 
-格式自动识别：
-  - new-format：源文件含名为 'Timesheet' 的 sheet，且表头有 'Employee' 列
-  - old-format：其余所有源文件
+Sheet 选取规则：
+  1. 优先使用 wb.active（默认打开页）
+  2. active 不可用时，fallback 到 sheetname == 'Timesheet'
+  3. 其他 sheet 一律跳过
+
+Staff ID / Name 扫描：
+  - 在前 10 行内扫描，允许不在同一行
 """
 
 import argparse
-import shutil
 import warnings
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 
 import openpyxl
-import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
 
-warnings.filterwarnings("ignore", category=UserWarning)  # 忽略 openpyxl 扩展警告
+warnings.filterwarnings("ignore", category=UserWarning)
 
 # ─────────────────────────────────────────────
 # 配置区（按需修改）
 # ─────────────────────────────────────────────
-DEFAULT_SRC_DIR = "./source_files"          # 源文件目录
-DEFAULT_OUT_DIR = "./output"                # 输出目录
-TEMPLATE_OLD    = "./templates/template-old-format.xlsx"
-TEMPLATE_NEW    = "./templates/template-new-format.xlsx"
+DEFAULT_SRC_DIR = "./source_files"
+DEFAULT_OUT_DIR = "./output"
 
-# 跳过这些 sheet（不是员工数据）
-SKIP_SHEETS = {"readme", "lists"}
+# 输出固定列定义（顺序即为输出顺序）
+OUTPUT_COLS = ["Date", "Role/Type", "Task Nature", "Module", "Hours", "Ref ID", "Staff ID", "Name"]
 
-# old-format 模板：数据表头行号、数据起始行号、目标 sheet
-OLD_HEADER_ROW  = 3
-OLD_DATA_START  = 4
-OLD_SHEET       = "FS"
-
-# new-format 模板：数据表头行号、数据起始行号、目标 sheet
-NEW_HEADER_ROW  = 10
-NEW_DATA_START  = 11
-NEW_SHEET       = "Timesheet"
 
 # ─────────────────────────────────────────────
 # Step 1：扫描源文件目录
@@ -62,55 +57,58 @@ def discover_files(src_dir: Path) -> list[Path]:
 
 
 # ─────────────────────────────────────────────
-# Step 2：识别文件格式
+# Step 2：日期处理工具
 # ─────────────────────────────────────────────
-def detect_format(wb: openpyxl.Workbook) -> str:
-    """
-    判断源文件格式：
-    - 有名为 'Timesheet' 的 sheet，且第3行表头含 'Employee' → 'new'
-    - 否则 → 'old'
-    """
-    sheet_names_lower = {s.lower(): s for s in wb.sheetnames}
-    if "timesheet" in sheet_names_lower:
-        ws = wb[sheet_names_lower["timesheet"]]
-        # 第3行表头检查
-        row3 = [str(c.value or "").strip() for c in ws[3]]
-        if any("employee" in v.lower() for v in row3):
-            return "new"
-    return "old"
+_TEXT_DATE_FMTS = [
+    "%d-%b-%y",    # 6-Apr-26
+    "%d-%b-%Y",    # 6-Apr-2026
+    "%d/%m/%Y",    # 06/04/2026
+    "%d/%m/%y",    # 06/04/26
+    "%m/%d/%Y",    # 04/06/2026 美式
+    "%Y-%m-%d",    # 2026-04-06 标准格式兜底
+]
 
-
-# ─────────────────────────────────────────────
-# Step 3：从单个 sheet 提取数据
-# ─────────────────────────────────────────────
-def _excel_serial_to_date(val) -> str | None:
-    """Excel 序列号或 datetime 转 yyyy-mm-dd 字符串"""
+def _parse_date(val) -> str | None:
+    """
+    将各种来源的日期值统一转为 yyyy-mm-dd 字符串。
+    返回 None 表示无效日期（如 'Total'），调用方应过滤该行。
+    """
     if val is None:
         return None
     if isinstance(val, (datetime, date)):
         return val.strftime("%Y-%m-%d")
     if isinstance(val, (int, float)):
-        # Excel epoch: 1900-01-01 = 1（注意 Excel 的 1900-02-29 bug）
         try:
-            from datetime import timedelta
-            base = datetime(1899, 12, 30)
-            return (base + timedelta(days=int(val))).strftime("%Y-%m-%d")
+            return (datetime(1899, 12, 30) + timedelta(days=int(val))).strftime("%Y-%m-%d")
         except Exception:
-            return str(val)
-    return str(val).strip() or None
+            return None
+    text = str(val).strip()
+    if not text:
+        return None
+    if "total" in text.lower():
+        return None
+    for fmt in _TEXT_DATE_FMTS:
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
 
 
+# ─────────────────────────────────────────────
+# Step 3：从单个 sheet 提取数据
+# ─────────────────────────────────────────────
 def _find_header_row(ws) -> tuple[int, dict]:
     """
-    自动在前6行里找含 'Date' 和 'Hours' 的表头行。
-    返回 (行号, {列名小写: 列索引(1-based)})
+    在前 15 行里找含 'date' 和 'hours' 的表头行。
+    返回 (行号, {列名小写: 列索引 1-based})
     """
-    for row_idx in range(1, 7):
+    for row_idx in range(1, 16):
         row_vals = [str(c.value or "").strip().lower() for c in ws[row_idx]]
         if "date" in row_vals and "hours" in row_vals:
             col_map = {v: i + 1 for i, v in enumerate(row_vals) if v}
             return row_idx, col_map
-    raise ValueError(f"在 sheet '{ws.title}' 的前6行未找到有效表头")
+    raise ValueError(f"在 sheet '{ws.title}' 的前 15 行未找到含 'Date' 和 'Hours' 的表头")
 
 
 def _get_col(col_map: dict, *candidates) -> int | None:
@@ -121,237 +119,176 @@ def _get_col(col_map: dict, *candidates) -> int | None:
     return None
 
 
-def extract_sheet(ws, staff_id: str, name: str) -> list[dict]:
+def extract_sheet(ws, staff_id: str, emp_name: str) -> list[dict]:
     """
-    从一个员工 sheet 提取所有有效行。
-    有效行：Date 和 Hours 均不为空。
+    从 sheet 提取有效行，只保留 8 个目标字段。
+    有效行条件：Date 可解析为日期 且 Hours 为数字。
     """
-    _, col_map = _find_header_row(ws)
-    header_row, _ = _find_header_row(ws)
+    header_row, col_map = _find_header_row(ws)
     data_start = header_row + 1
 
-    # 列索引映射（兼容两种格式的不同列名）
-    c_date    = _get_col(col_map, "date")
-    c_role    = _get_col(col_map, "role / type", "role/type", "role / type ")
-    c_module  = _get_col(col_map, "module")
-    c_task    = _get_col(col_map, "task nature")
-    c_desc    = _get_col(col_map, "description / notes", "description / notes (optional)",
-                          "description/notes", "description / notes ")
-    c_refid   = _get_col(col_map, "ref id (no need)", "ref id", "ref/ticket #", "ref id (no need) ")
-    c_related = _get_col(col_map, "related number (auto) (no need)", "related number (auto)",
-                          "related number (auto) (no need) ")
-    c_hours   = _get_col(col_map, "hours")
-    c_status  = _get_col(col_map, "status", "status (optional)")
+    c_date  = _get_col(col_map, "date")
+    c_role  = _get_col(col_map,
+                        "role / type", "role/type", "role/type ", "role / type ")
+    c_task  = _get_col(col_map,
+                        "task nature", "task nature ")
+    c_mod   = _get_col(col_map,
+                        "module", "module ")
+    c_hours = _get_col(col_map,
+                        "hours", "hours ")
+    c_refid = _get_col(col_map,
+                        "ref id", "ref id (no need)", "ref/ticket #",
+                        "ref id (mandatory for cr and ce, optional for production incident and ec ticket for now)",
+                        "ref id \n(mandatory for cr and ce, optional for production incident and ec ticket for now)",
+                        "ref id (no need) ")
 
     rows = []
     for row in ws.iter_rows(min_row=data_start, values_only=True):
+
         def g(col_idx):
             if col_idx is None:
                 return None
             v = row[col_idx - 1] if col_idx <= len(row) else None
             if isinstance(v, str):
                 v = v.strip()
-                return None if v in ("", " ") else v
+                return None if v == "" else v
             return v
 
         raw_date  = g(c_date)
         raw_hours = g(c_hours)
 
-        # 过滤：Date 和 Hours 都必须有值
         if raw_date is None or raw_hours is None:
             continue
         try:
             hours_val = float(raw_hours)
         except (TypeError, ValueError):
             continue
+        parsed_date = _parse_date(raw_date)
+        if parsed_date is None:
+            continue
 
         rows.append({
-            "Date":           _excel_serial_to_date(raw_date),
-            "Role / Type":    g(c_role),
-            "Module":         g(c_module),
-            "Task Nature":    g(c_task),
-            "Description":    g(c_desc),
-            "Ref ID":         g(c_refid),
-            "Related Number": g(c_related),
-            "Hours":          hours_val,
-            "Status":         g(c_status),
-            "Staff ID":       staff_id,
-            "Name":           name,
+            "Date":        parsed_date,
+            "Role/Type":   g(c_role),
+            "Task Nature": g(c_task),
+            "Module":      g(c_mod),
+            "Hours":       hours_val,
+            "Ref ID":      g(c_refid),
+            "Staff ID":    staff_id,
+            "Name":        emp_name,
         })
     return rows
 
 
 # ─────────────────────────────────────────────
-# Step 4：解析一个源文件 → 标准化记录列表
+# Step 4：解析单个源文件
 # ─────────────────────────────────────────────
-def parse_source(path: Path) -> tuple[str, list[dict]]:
+def parse_source(path: Path) -> list[dict]:
     """
-    读取一个源文件，返回 (格式类型, 记录列表)。
-    格式类型: 'old' | 'new'
+    读取源文件，返回标准化记录列表。
+    Sheet 选取：优先 active sheet，fallback 到 'Timesheet'。
     """
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True, keep_links=False)
-    fmt = detect_format(wb)
 
-    all_rows = []
-    # 只处理 sheetname == 'Timesheet' 的 sheet，其余一律跳过
-    for sname in wb.sheetnames:
-        if sname.lower() != "timesheet":
-            print(f"  [跳过] sheet '{sname}'：非 Timesheet")
-            continue
+    # ── 选取目标 sheet ──
+    active_ws = wb.active
+    if active_ws is not None:
+        ws = active_ws
+        print(f"  [候选] 使用 active sheet：'{ws.title}'")
+    else:
+        ws = None
+        for sname in wb.sheetnames:
+            if sname.lower() == "timesheet":
+                ws = wb[sname]
+                print(f"  [候选] active 不可用，fallback 到 sheet：'{sname}'")
+                break
+        if ws is None:
+            print(f"  [跳过] {path.name}：未找到可用 sheet")
+            wb.close()
+            return []
 
-        ws = wb[sname]
-        try:
-            if ws.sheet_state != "visible":
-                print(f"  [跳过] sheet '{sname}'：隐藏 sheet，忽略")
-                continue
-        except AttributeError:
-            pass  # read_only 模式下 sheet_state 不可用，继续处理
+    # ── 隐藏 sheet 检测 ──
+    try:
+        if ws.sheet_state != "visible":
+            print(f"  [跳过] sheet '{ws.title}'：隐藏 sheet，忽略")
+            wb.close()
+            return []
+    except AttributeError:
+        pass
 
-        # 在前5行内扫描 Staff ID 和 Name（兼容第1行空白的情况）
-        staff_id, emp_name = "", ""
-        for scan_row in ws.iter_rows(min_row=1, max_row=5, values_only=True):
-            row_vals = list(scan_row)
-            for i, val in enumerate(row_vals):
-                label = str(val or "").strip().lower()
-                if label == "staff id" and i + 1 < len(row_vals):
-                    staff_id = str(row_vals[i + 1] or "").strip()
-                if label == "name" and i + 1 < len(row_vals):
-                    emp_name = str(row_vals[i + 1] or "").strip()
-            if staff_id and emp_name:
-                break  # 两个都找到了，不再继续扫描
+    # ── 前 10 行扫描 Staff ID / Name（允许不同行） ──
+    staff_id, emp_name = "", ""
+    for scan_row in ws.iter_rows(min_row=1, max_row=10, values_only=True):
+        row_vals = list(scan_row)
+        for i, val in enumerate(row_vals):
+            label = str(val or "").strip().lower()
+            if not staff_id and label == "staff id" and i + 1 < len(row_vals):
+                staff_id = str(row_vals[i + 1] or "").strip()
+            if not emp_name and label == "name" and i + 1 < len(row_vals):
+                emp_name = str(row_vals[i + 1] or "").strip()
+        if staff_id and emp_name:
+            break
 
-        if not emp_name and not staff_id:
-            print(f"  [跳过] {path.name} → sheet '{sname}'：未找到 Staff ID / Name")
-            continue
+    if not staff_id and not emp_name:
+        print(f"  [跳过] {path.name} → sheet '{ws.title}'：未找到 Staff ID / Name")
+        wb.close()
+        return []
 
-        try:
-            sheet_rows = extract_sheet(ws, staff_id, emp_name)
-            print(f"  [读取] {path.name} → '{sname}' ({emp_name})：{len(sheet_rows)} 行有效数据")
-            all_rows.extend(sheet_rows)
-        except ValueError as e:
-            print(f"  [警告] {path.name} → '{sname}'：{e}，已跳过")
+    # ── 提取数据 ──
+    try:
+        rows = extract_sheet(ws, staff_id, emp_name)
+        print(f"  [读取] '{ws.title}' ({emp_name} / {staff_id})：{len(rows)} 行有效数据")
+    except ValueError as e:
+        print(f"  [警告] {path.name} → '{ws.title}'：{e}，已跳过")
+        rows = []
 
     wb.close()
-    return fmt, all_rows
+    return rows
 
 
 # ─────────────────────────────────────────────
-# Step 5：写入 old-format 模板
+# Step 5：写入输出文件
 # ─────────────────────────────────────────────
-def write_old_format(records: list[dict], template_path: Path, out_path: Path):
-    """将记录写入 old-format 模板的 FS sheet"""
-    shutil.copy(template_path, out_path)
-    wb = openpyxl.load_workbook(out_path)
-    ws = wb[OLD_SHEET]
+def write_output(records: list[dict], out_path: Path):
+    """
+    创建干净的 xlsx，写入固定 8 列数据。
+    表头加粗 + 浅蓝底色，首行冻结，列宽固定。
+    """
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Timesheet"
 
-    # 清除模板里的示例数据行（第4行起）
-    for row in ws.iter_rows(min_row=OLD_DATA_START, max_row=ws.max_row):
-        for cell in row:
-            cell.value = None
+    header_font  = Font(bold=True)
+    header_fill  = PatternFill("solid", fgColor="BDD7EE")
+    header_align = Alignment(horizontal="center", vertical="center")
 
-    # 写入数据
-    # old-format 列顺序（对应 row3 表头）：
-    # A=Date, B=Role/Type, C=Module, D=Task Nature, E=Description,
-    # F=Ref ID, G=Related Number, H=Hours, I=Status, J=Staff ID, K=Name
-    for i, rec in enumerate(records):
-        r = OLD_DATA_START + i
-        ws.cell(r, 1).value  = rec["Date"]
-        ws.cell(r, 2).value  = rec["Role / Type"]
-        ws.cell(r, 3).value  = rec["Module"]
-        ws.cell(r, 4).value  = rec["Task Nature"]
-        ws.cell(r, 5).value  = rec["Description"]
-        ws.cell(r, 6).value  = rec["Ref ID"]
-        ws.cell(r, 7).value  = rec["Related Number"]
-        ws.cell(r, 8).value  = rec["Hours"]
-        ws.cell(r, 9).value  = rec["Status"]
-        ws.cell(r, 10).value = rec["Staff ID"]
-        ws.cell(r, 11).value = rec["Name"]
+    # 写表头
+    for col_idx, col_name in enumerate(OUTPUT_COLS, 1):
+        cell = ws.cell(row=1, column=col_idx, value=col_name)
+        cell.font      = header_font
+        cell.fill      = header_fill
+        cell.alignment = header_align
+
+    # 写数据
+    for row_idx, rec in enumerate(records, 2):
+        ws.cell(row_idx, 1).value = rec["Date"]
+        ws.cell(row_idx, 2).value = rec["Role/Type"]
+        ws.cell(row_idx, 3).value = rec["Task Nature"]
+        ws.cell(row_idx, 4).value = rec["Module"]
+        ws.cell(row_idx, 5).value = rec["Hours"]
+        ws.cell(row_idx, 6).value = rec["Ref ID"]
+        ws.cell(row_idx, 7).value = rec["Staff ID"]
+        ws.cell(row_idx, 8).value = rec["Name"]
+
+    # 列宽
+    for col_idx, width in zip(range(1, 9), [14, 16, 18, 18, 8, 14, 14, 20]):
+        ws.column_dimensions[ws.cell(1, col_idx).column_letter].width = width
+
+    # 冻结首行
+    ws.freeze_panes = "A2"
 
     wb.save(out_path)
-    print(f"[输出] old-format → {out_path}（{len(records)} 行）")
-
-
-# ─────────────────────────────────────────────
-# Step 6：写入 new-format 模板
-# ─────────────────────────────────────────────
-def _remove_external_links(xlsx_path: Path):
-    """
-    清除 xlsx 文件内嵌的 externalLinks（外部链接）。
-    模板若含断链外部引用，Excel 打开时会弹出修复警告，此函数提前清理。
-    """
-    import zipfile, shutil, re
-    tmp_path = xlsx_path.with_suffix('.tmp.xlsx')
-    with zipfile.ZipFile(xlsx_path, 'r') as zin,          zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED) as zout:
-        for item in zin.infolist():
-            # 跳过 externalLinks 相关文件
-            if 'externalLinks' in item.filename:
-                continue
-            data = zin.read(item.filename)
-            # 清理 workbook.xml 里对 externalLinks 的 Relationship 引用
-            if item.filename == 'xl/_rels/workbook.xml.rels':
-                data = re.sub(
-                    rb'<Relationship[^>]+externalLink[^>]+/>',
-                    b'', data
-                )
-            # 清理 workbook.xml 里的外部引用
-            if item.filename == 'xl/workbook.xml':
-                # 清除 <externalReferences> 整块
-                data = re.sub(rb'<externalReference[^>]+/>', b'', data)
-                data = re.sub(rb'<externalReferences>.*?</externalReferences>', b'', data, flags=re.DOTALL)
-                # 清除 definedNames 里引用外部工作簿的条目（形如 [1]Sheet!$A$1）
-                data = re.sub(rb'<definedName[^>]*>\[[0-9]+\][^<]*</definedName>', b'', data)
-            # 清理 [Content_Types].xml 里对 externalLinks 的声明
-            if item.filename == '[Content_Types].xml':
-                data = re.sub(
-                    rb'<Override[^>]+externalLink[^>]+/>',
-                    b'', data
-                )
-            zout.writestr(item, data)
-    tmp_path.replace(xlsx_path)
-
-
-def write_new_format(records: list[dict], template_path: Path, out_path: Path):
-    """
-    将记录写入 new-format 模板的 Timesheet sheet。
-    Week# 区域（行1-9）保持原样不动，只填数据区（行10起）。
-    new-format 列顺序（row10 表头）：
-    A=Date, B=Role/Type, C=Task Nature, D=Module, E=Ref ID,
-    F=Related Number(公式保留), G=Description, H=Hours,
-    I=Status, J=Remarks, K=Staff ID, L=Name
-    """
-    shutil.copy(template_path, out_path)
-    _remove_external_links(out_path)   # 清除模板内嵌的断链外部引用
-    wb = openpyxl.load_workbook(out_path)
-    ws = wb[NEW_SHEET]
-
-    # 清除模板数据区（第11行起），保留第10行表头和第1-9行 Week 区
-    for row in ws.iter_rows(min_row=NEW_DATA_START, max_row=ws.max_row):
-        for cell in row:
-            cell.value = None
-
-    for i, rec in enumerate(records):
-        r = NEW_DATA_START + i
-        ws.cell(r, 1).value  = rec["Date"]
-        ws.cell(r, 2).value  = rec["Role / Type"]
-        ws.cell(r, 3).value  = rec["Task Nature"]
-        ws.cell(r, 4).value  = rec["Module"]
-        ws.cell(r, 5).value  = rec["Ref ID"]
-        # 列F：Related Number，写入公式（与模板行11-500一致）
-        ws.cell(r, 6).value  = (
-            f'=IFERROR(IF(C{r}="Change Enhancement","CE-"&E{r},'
-            f'IF(C{r}="Change Request","CR-"&E{r},'
-            f'IF(C{r}="EC Ticket","EC -"&E{r},'
-            f'IF(C{r}="Production Incident","PROD -"&E{r},"")))),"")'
-        )
-        ws.cell(r, 7).value  = rec["Description"]
-        ws.cell(r, 8).value  = rec["Hours"]
-        ws.cell(r, 9).value  = rec["Status"]
-        ws.cell(r, 10).value = None           # Remarks：留空
-        ws.cell(r, 11).value = rec["Staff ID"]
-        ws.cell(r, 12).value = rec["Name"]
-
-    wb.save(out_path)
-    print(f"[输出] new-format → {out_path}（{len(records)} 行）")
+    print(f"[输出] → {out_path}（{len(records)} 行）")
 
 
 # ─────────────────────────────────────────────
@@ -361,83 +298,53 @@ def main():
     parser = argparse.ArgumentParser(description="Timesheet Merger")
     parser.add_argument("--src", default=DEFAULT_SRC_DIR, help="源文件目录")
     parser.add_argument("--out", default=DEFAULT_OUT_DIR, help="输出目录")
-    parser.add_argument("--tpl-old", default=TEMPLATE_OLD, help="old-format 模板路径")
-    parser.add_argument("--tpl-new", default=TEMPLATE_NEW, help="new-format 模板路径")
     args = parser.parse_args()
 
-    src_dir      = Path(args.src)
-    out_dir      = Path(args.out)
-    tpl_old_path = Path(args.tpl_old)
-    tpl_new_path = Path(args.tpl_new)
+    src_dir = Path(args.src)
+    out_dir = Path(args.out)
 
-    # 检查路径
     if not src_dir.exists():
         raise FileNotFoundError(f"源文件目录不存在：{src_dir}")
-    if not tpl_old_path.exists():
-        raise FileNotFoundError(f"old-format 模板不存在：{tpl_old_path}")
-    if not tpl_new_path.exists():
-        raise FileNotFoundError(f"new-format 模板不存在：{tpl_new_path}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Step 1：扫描文件
+    # Step 1：扫描
     files = discover_files(src_dir)
 
-    # Step 2-4：逐文件解析，按格式分类
-    old_records: list[dict] = []
-    new_records: list[dict] = []
-    # 用 dict 保序去重：key=(Staff ID, Name)，value=所属格式
-    old_staff: dict[tuple, None] = {}
-    new_staff: dict[tuple, None] = {}
+    # Step 2-4：逐文件解析
+    all_records: list[dict] = []
+    all_staff: dict[tuple, None] = {}
 
     for idx, path in enumerate(files, 1):
         print(f"\n[{idx}/{len(files)}] 处理：{path.name}")
         try:
-            fmt, rows = parse_source(path)
-            if fmt == "new":
-                new_records.extend(rows)
-                for r in rows:
-                    new_staff.setdefault((r["Staff ID"], r["Name"]), None)
-            else:
-                old_records.extend(rows)
-                for r in rows:
-                    old_staff.setdefault((r["Staff ID"], r["Name"]), None)
+            rows = parse_source(path)
+            all_records.extend(rows)
+            for r in rows:
+                all_staff.setdefault((r["Staff ID"], r["Name"]), None)
         except Exception as e:
             print(f"  [错误] {path.name}：{e}，已跳过")
 
-    # Step 5-6：写入输出
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    # Step 5：写入
     print()
-
-    if old_records:
-        out_old = out_dir / f"output_old_{timestamp}.xlsx"
-        write_old_format(old_records, tpl_old_path, out_old)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    if all_records:
+        out_path = out_dir / f"output_{timestamp}.xlsx"
+        write_output(all_records, out_path)
     else:
-        print("[跳过] 无 old-format 数据，不生成 output_old.xlsx")
+        print("[跳过] 无有效数据，未生成输出文件")
 
-    if new_records:
-        out_new = out_dir / f"output_new_{timestamp}.xlsx"
-        write_new_format(new_records, tpl_new_path, out_new)
-    else:
-        print("[跳过] 无 new-format 数据，不生成 output_new.xlsx")
-
-    # Step 7：员工统计汇总
+    # Step 6：统计汇总
     print("\n" + "─" * 50)
     print("📊 员工统计汇总")
     print("─" * 50)
-
-    def _print_staff(label: str, staff: dict):
-        print(f"\n【{label}】共 {len(staff)} 人：")
-        if staff:
-            for i, (sid, name) in enumerate(staff.keys(), 1):
-                print(f"  {i:>3}. {sid:<12} {name}")
-        else:
-            print("  （无数据）")
-
-    _print_staff("output_old", old_staff)
-    _print_staff("output_new", new_staff)
+    print(f"\n【output】共 {len(all_staff)} 人：")
+    if all_staff:
+        for i, (sid, name) in enumerate(all_staff.keys(), 1):
+            print(f"  {i:>3}. {sid:<12} {name}")
+    else:
+        print("  （无数据）")
     print(f"\n{'─' * 50}")
-    print(f"合计：old-format {len(old_records)} 行 / {len(old_staff)} 人，"
-          f"new-format {len(new_records)} 行 / {len(new_staff)} 人。")
+    print(f"合计：{len(all_records)} 行 / {len(all_staff)} 人。")
 
 
 if __name__ == "__main__":
