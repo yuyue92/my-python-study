@@ -90,12 +90,14 @@ def load_staff_from_clipboard() -> dict:
         result = {}
         for _, row in df.iterrows():
             sid = row[STAFF_ID_COL]
-            result[sid] = {
+            info = {
                 "Function":    str(row.get("Function",    "") or "").strip() or "-",
                 "Workstream":  str(row.get("Workstream",  "") or "").strip() or "-",
                 "Subteam":     str(row.get("Subteam",     "") or "").strip() or "-",
                 "Sub-Subteam": str(row.get("Sub-Subteam", "") or "").strip() or "-",
             }
+            result[sid] = info                    # 原始：02013999
+            result[sid.lstrip("0")] = info        # 去掉前导零：2013999
 
         logger.info(f"[花名册] 已从剪贴板加载 {len(result)} 条记录")
         return result
