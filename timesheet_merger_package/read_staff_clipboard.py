@@ -1,16 +1,27 @@
+import io
+import csv
 import pandas as pd
+import pyperclip
 
 # ── 配置区 ────────────────────────────────────────────────────
-# 复制范围：从 A列标题行（SID那行）开始，到右下角结束
-# 列名以实际标题为准，有偏差直接改这里
 ID_COL         = "SID"
 COLUMNS_NEEDED = ["SID", "Function", "Workstream", "Subteam", "Sub-Subteam"]
 # ──────────────────────────────────────────────────────────────
 
 
 def load_staff_from_clipboard():
-    # 直接读剪贴板，第一行自动识别为列标题
-    df = pd.read_clipboard(dtype={ID_COL: str})
+    # 读取 Windows 剪贴板原始文本
+    raw = pyperclip.paste()
+
+    # 用 StringIO 包装后交给 pandas 解析，QUOTE_NONE 避免引号干扰
+    df = pd.read_csv(
+        io.StringIO(raw),
+        sep="\t",
+        engine="python",
+        quoting=csv.QUOTE_NONE,
+        on_bad_lines="skip",
+        dtype={ID_COL: str},
+    )
 
     # 去掉整行全空的行
     df.dropna(how="all", inplace=True)
